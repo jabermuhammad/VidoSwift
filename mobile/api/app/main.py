@@ -52,7 +52,12 @@ async def invalid_request_handler(_request: Request, _exc: RequestValidationErro
     return error_response(422, "invalid_request", "Provide a video URL in the request body.")
 
 
-@app.get("/v1/health", response_model=HealthResponse, tags=["health"])
+@app.api_route(
+    "/v1/health",
+    methods=["GET", "HEAD"],
+    response_model=HealthResponse,
+    tags=["health"],
+)
 def health() -> dict:
     return {
         "ok": True,
