@@ -1,0 +1,1 @@
+"""VidoSwift mobile API service."""
