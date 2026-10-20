@@ -1,0 +1,17 @@
+# Generated application artifacts and local build caches
+/backend/bin/*
+!/backend/bin/node-LICENSE.txt
+/backend/**/__pycache__/
+*.py[cod]
+/.venv/
+/ui/node_modules/
+/ui/dist/
+/release/
+/outputs/
+/work/
+/pip-cache/
+/pnpm-store/
+/python-packages/
+/wheels/
+/.env*
+**/*.log

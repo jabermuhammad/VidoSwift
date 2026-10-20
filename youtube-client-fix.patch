@@ -1,0 +1,599 @@
+diff -ruN a/backend/app.py b/backend/app.py
+--- a/backend/app.py	2026-10-18 04:28:50.000000000 +0600
++++ b/backend/app.py	2026-10-18 14:16:17.711489155 +0600
+@@ -30,10 +30,11 @@
+ from yt_dlp import YoutubeDL
+ from yt_dlp import cookies as yt_dlp_cookies
+ from yt_dlp.version import __version__ as YT_DLP_VERSION
++from yt_dlp.version import CHANNEL as YT_DLP_CHANNEL
+ from yt_dlp.utils import DownloadCancelled
+ 
+ APP_TITLE = "VidoSwift Video Downloader"
+-APP_BUILD_VERSION = "1.0.0-cookie-diagnostics-20261018.1"
++APP_BUILD_VERSION = "1.0.0-youtube-client-fix-20261018.1"
+ APP_DATA = Path(os.environ.get("APPDATA", Path.home())) / "VidoSwift"
+ STATE_FILE = APP_DATA / "state.json"
+ DEFAULT_FOLDER = Path.home() / "Downloads" / "VidoSwift"
+@@ -49,6 +50,47 @@
+     return host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com") or host == "youtube-nocookie.com" or host.endswith(".youtube-nocookie.com")
+ 
+ 
++# yt-dlp 2026.08.19 requests the `tv_downgraded` client for signed-in YouTube sessions. YouTube
++# answers it with "The page needs to be reloaded." (yt-dlp issue #17389). Upstream replaced it
++# with `tv_samsung` in nightly 2026.10.10 (PRs #17723 and #17805); no stable release has it yet.
++YT_DLP_YOUTUBE_FIX_VERSION = (2026, 10, 10)
++YOUTUBE_ID_PATTERNS = (
++    re.compile(r"[?&]v=([\w-]{11})"),
++    re.compile(r"(?:youtu\.be|/shorts|/embed|/live|/v)/([\w-]{11})"),
++)
++
++
++def version_tuple(value) -> tuple:
++    return tuple(int(part) for part in re.findall(r"\d+", str(value))[:4])
++
++
++def youtube_extractor_args(version=None) -> dict:
++    """yt-dlp extractor arguments applied identically to analysis and download.
++
++    Bundled yt-dlp older than the upstream fix must not use the broken client; newer
++    builds keep yt-dlp's own defaults (and `-tv_downgraded` would be a harmless no-op).
++    """
++    if version_tuple(YT_DLP_VERSION if version is None else version) >= YT_DLP_YOUTUBE_FIX_VERSION:
++        return {}
++    return {"youtube": {"player_client": ["default", "-tv_downgraded"]}}
++
++
++def youtube_video_id(url: str) -> str:
++    for pattern in YOUTUBE_ID_PATTERNS:
++        match = pattern.search(url or "")
++        if match:
++            return match.group(1)
++    return "unknown"
++
++
++def redact_home(value) -> str:
++    """Replace the user's home directory (and so their Windows account name) in diagnostics."""
++    text = str(value)
++    home = str(Path.home())
++    return text.replace(home, "~") if home and home not in ("/", "\\") else text
++
++
++IS_WINDOWS = os.name == "nt"
+ _T0 = time.monotonic()
+ _log = logging.getLogger("vidoswift.startup")
+ _single_instance_handle = None
+@@ -106,7 +148,7 @@
+     def traced_copy(database_path, temp_dir):
+         browser = getattr(_COOKIE_DIAG_CONTEXT, "browser", None)
+         if browser:
+-            log_stage("cookie_database_copy", "started", f"browser={browser} database_path={database_path}")
++            log_stage("cookie_database_copy", "started", f"browser={browser} database_path={redact_home(database_path)}")
+         try:
+             cursor = original_copy(database_path, temp_dir)
+         except Exception as exc:
+@@ -114,7 +156,7 @@
+                 log_exception("cookie_database_copy", exc)
+             raise
+         if browser:
+-            log_stage("cookie_database_copy", "success", f"browser={browser} database_path={database_path}")
++            log_stage("cookie_database_copy", "success", f"browser={browser} database_path={redact_home(database_path)}")
+         return cursor
+ 
+     yt_dlp_cookies._open_database_copy = traced_copy
+@@ -176,9 +218,9 @@
+             pass
+     exe_path = Path(sys.executable).resolve() if getattr(sys, "frozen", False) else Path(__file__).resolve()
+     log_stage("build_identity", "runtime",
+-              f"app_version={APP_BUILD_VERSION} exe_path={exe_path} base_dir={BASE_DIR}")
++              f"app_version={APP_BUILD_VERSION} exe_path={redact_home(exe_path)} base_dir={redact_home(BASE_DIR)}")
+     log_stage("build_identity", "components",
+-              f"yt_dlp={YT_DLP_VERSION} source_app_sha256={build_info.get('backend_app_sha256', 'unavailable')} "
++              f"yt_dlp={YT_DLP_VERSION} yt_dlp_channel={YT_DLP_CHANNEL} youtube_extractor_args={json.dumps(youtube_extractor_args(), sort_keys=True)} source_app_sha256={build_info.get('backend_app_sha256', 'unavailable')} "
+               f"build_info_version={build_info.get('app_build_version', 'not_embedded')} "
+               f"build_info_yt_dlp={build_info.get('yt_dlp_version', 'not_embedded')} "
+               f"build_info_ui_sha256={build_info.get('ui_index_sha256', 'not_embedded')}")
+@@ -196,7 +238,7 @@
+             profile_path, database_path = resolve_browser_cookie_profile(browser)
+             status = "detected" if database_path else "database_not_found"
+             log_stage("browser_profile", status,
+-                      f"browser={browser} profile_path={profile_path or 'unavailable'} database_path={database_path or 'unavailable'}")
++                      f"browser={browser} profile_path={redact_home(profile_path or 'unavailable')} database_path={redact_home(database_path or 'unavailable')}")
+         except Exception as exc:
+             log_exception("browser_profile_detection", exc)
+             log_stage("browser_profile", "detection_failed", f"browser={browser} exception={type(exc).__name__}")
+@@ -518,6 +560,72 @@
+         pass
+ 
+ 
++class DiagnosticLogger(QuietLogger):
++    """Keep yt-dlp quiet for the UI, but record which YouTube clients were tried.
++
++    Only player-client progress, playability status and warnings are kept, sanitized and
++    length-limited; raw extractor dumps, headers and cookies are never written.
++    """
++    _KEEP = re.compile(r"player API JSON|player response playability status", re.IGNORECASE)
++
++    def __init__(self):
++        self._lines = 0
++
++    def _record(self, status, message):
++        if self._lines < 40:
++            self._lines += 1
++            log_stage("ytdlp_" + status, "info", sanitize_diagnostic_text(message)[:300])
++
++    def debug(self, message):
++        if self._KEEP.search(str(message)):
++            self._record("trace", message)
++
++    def warning(self, message):
++        self._record("warning", message)
++
++    def error(self, message):
++        self._record("error", message)
++
++
++class DiagnosticYoutubeDL(YoutubeDL):
++    """YoutubeDL that forwards the extractor's playability-status debug lines (normally
++    verbose-only) to the diagnostic logger without enabling verbose mode."""
++
++    def write_debug(self, message, only_once=False):
++        logger = self.params.get("logger")
++        if isinstance(logger, DiagnosticLogger):
++            logger.debug(message)
++        else:
++            super().write_debug(message, only_once=only_once)
++
++
++def ytdlp_options(url: str, socket_timeout: int) -> dict:
++    """Options shared by metadata analysis and download, so both follow one YouTube config."""
++    options = {"quiet": True, "no_warnings": True, "noprogress": True, "logger": DiagnosticLogger(),
++               "noplaylist": True, "socket_timeout": socket_timeout}
++    if youtube_host(url):
++        options["extractor_args"] = youtube_extractor_args()
++    return options
++
++
++def log_youtube_request(stage: str, url: str, cookie_browser) -> None:
++    if youtube_host(url):
++        log_stage(stage, "request",
++                  f"app_version={APP_BUILD_VERSION} yt_dlp={YT_DLP_VERSION}/{YT_DLP_CHANNEL} "
++                  f"domain={urlparse(url).hostname} video_id={youtube_video_id(url)} "
++                  f"cookie_mode={'browser:' + cookie_browser if cookie_browser else 'off'} "
++                  f"extractor_args={json.dumps(youtube_extractor_args(), sort_keys=True)}")
++
++
++def log_youtube_clients_used(stage: str, info) -> None:
++    try:
++        clients = sorted({str(f.get("__yt_dlp_client")) for f in (info or {}).get("formats", []) if f.get("__yt_dlp_client")})
++        if clients:
++            log_stage(stage, "clients_used", ",".join(clients))
++    except Exception:
++        pass
++
++
+ class VidoSwiftApi:
+     def __init__(self, on_first_health=None):
+         log_stage("api_init", "started")
+@@ -624,15 +732,17 @@
+             host = urlparse(url).hostname or "unknown"
+             log_stage("youtube_metadata_analysis", "started", f"host={host}")
+             ensure_writable_temp_dir()
+-            options = {"quiet": True, "no_warnings": True, "noprogress": True, "logger": QuietLogger(), "skip_download": True, "noplaylist": True, "socket_timeout": 20}
++            options = {**ytdlp_options(url, 20), "skip_download": True}
+             cookie_browser = self._cookie_browser(url)
++            log_youtube_request("youtube_metadata_analysis", url, cookie_browser)
+             with browser_cookie_diagnostics(cookie_browser, host) as profile_path:
+                 if cookie_browser:
+                     options["cookiesfrombrowser"] = (cookie_browser, profile_path, None, None)
+-                with YoutubeDL(options) as ydl:
++                with DiagnosticYoutubeDL(options) as ydl:
+                     if cookie_browser:
+                         load_cookie_jar_for_diagnostics(ydl, cookie_browser)
+                     info = ydl.extract_info(url, download=False)
++            log_youtube_clients_used("youtube_metadata_analysis", info)
+             if not info:
+                 raise ValueError("The site returned no video information.")
+             formats = [clean_format(f) for f in info.get("formats", []) if f.get("format_id")]
+@@ -684,6 +794,11 @@
+                     f"If {browser_name} keeps running in the background, turn off its background-app setting before exiting. "
+                     "You can also choose another browser in Settings where you are signed in. "
+                     "VidoSwift reads browser cookies locally only after your consent; it does not export or log cookie values.")
++        if "page needs to be reloaded" in lowered:
++            return ("YouTube rejected VidoSwift's request (\"The page needs to be reloaded\"). This is a YouTube compatibility "
++                    f"problem in the bundled download engine (yt-dlp {YT_DLP_VERSION}), not a problem with your link or your account. "
++                    "Install the latest VidoSwift update, which includes a newer YouTube engine, and retry. "
++                    "VidoSwift cannot bypass YouTube's checks. Turning browser-cookie access off in Settings may also help for public videos.")
+         if "sign in to confirm" in lowered or "not a bot" in lowered or "confirm you're not" in lowered:
+             return ("YouTube requires a signed-in browser session. VidoSwift cannot bypass this check. "
+                     "To try your own session, open Settings → YouTube browser cookies, explicitly enable access, "
+@@ -816,10 +931,10 @@
+             if data.get("filename"):
+                 updates["filepath"] = str(data["filename"])
+             self._update_job(job_id, updates)
+-        options = {"format": selector, "outtmpl": os.path.join(request["folder"], f"[{job_id[:8]}] %(title).180B [%(id)s].%(ext)s"),
+-            "noplaylist": True, "progress_hooks": [hook], "postprocessors": postprocessors,
+-            "ignoreerrors": False, "quiet": True, "no_warnings": True, "noprogress": True, "logger": QuietLogger(), "socket_timeout": 30,
+-            "windowsfilenames": True}
++        options = {**ytdlp_options(request["url"], 30), "format": selector,
++            "outtmpl": os.path.join(request["folder"], f"[{job_id[:8]}] %(title).180B [%(id)s].%(ext)s"),
++            "progress_hooks": [hook], "postprocessors": postprocessors,
++            "ignoreerrors": False, "windowsfilenames": True}
+         cookie_browser = self._cookie_browser(request["url"])
+         host = urlparse(request["url"]).hostname or "unknown"
+         ffmpeg = BASE_DIR / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+@@ -834,10 +949,11 @@
+         try:
+             ensure_writable_temp_dir()
+             log_stage("video_download", "started", f"host={host}")
++            log_youtube_request("video_download", request["url"], cookie_browser)
+             with browser_cookie_diagnostics(cookie_browser, host) as profile_path:
+                 if cookie_browser:
+                     options["cookiesfrombrowser"] = (cookie_browser, profile_path, None, None)
+-                with YoutubeDL(options) as ydl:
++                with DiagnosticYoutubeDL(options) as ydl:
+                     if cookie_browser:
+                         load_cookie_jar_for_diagnostics(ydl, cookie_browser)
+                     result = ydl.download([request["url"]])
+@@ -1024,7 +1140,7 @@
+ 
+ 
+ def _run() -> int:
+-    if os.name == "nt":
++    if IS_WINDOWS:
+         runtime = webview2_runtime_version()
+         if not runtime:
+             log_stage("webview2_runtime", "missing")
+diff -ruN a/backend/requirements.txt b/backend/requirements.txt
+--- a/backend/requirements.txt	2026-10-18 00:19:40.000000000 +0600
++++ b/backend/requirements.txt	2026-10-18 14:17:29.900301572 +0600
+@@ -1,4 +1,4 @@
+-yt-dlp[default]==2026.8.19
++yt-dlp[default]==2026.10.10.233141.dev0
+ pywebview==6.2.1
+ pyinstaller==6.22.3
+ imageio-ffmpeg==0.6.0
+diff -ruN a/backend/tests/test_backend.py b/backend/tests/test_backend.py
+--- a/backend/tests/test_backend.py	2026-10-18 04:28:54.000000000 +0600
++++ b/backend/tests/test_backend.py	2026-10-18 14:16:57.658273014 +0600
+@@ -386,12 +386,255 @@
+ 
+     def test_missing_webview2_runtime_stops_before_creating_a_window(self):
+         with unittest.mock.patch.object(app, "webview2_runtime_version", lambda: None), \
+-             unittest.mock.patch.object(app.os, "name", "nt"), \
++             unittest.mock.patch.object(app, "IS_WINDOWS", True), \
+              unittest.mock.patch.object(app, "acquire_single_instance", lambda: True), \
+              unittest.mock.patch.object(app, "release_single_instance", lambda: None):
+             self.assertEqual(app.main(), 2)
+         self.assertEqual(len(self.stages("fatal_message")), 1)
+ 
+ 
++class YouTubeClientConfigTests(unittest.TestCase):
++    """Regression for "ERROR: [youtube] <id>: The page needs to be reloaded." (yt-dlp #17389).
++
++    2026.08.19 asks YouTube's `tv_downgraded` client for signed-in sessions; YouTube rejects it.
++    """
++
++    @staticmethod
++    def fake_cookie(name):
++        from http.cookiejar import Cookie
++        return Cookie(0, name, "x", None, False, ".youtube.com", True, True, "/", True, True, None, False, None, None, {})
++
++    def requested_clients(self, signed_in):
++        options = dict(app.ytdlp_options("https://www.youtube.com/watch?v=aqz-KE-bpKQ", 20))
++        options["logger"] = app.QuietLogger()
++        with app.YoutubeDL(options) as ydl:
++            if signed_in:  # fake cookies only make yt-dlp's own "is signed in" check true
++                for name in ("LOGIN_INFO", "SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID"):
++                    ydl.cookiejar.set_cookie(self.fake_cookie(name))
++            ie = ydl.get_info_extractor("Youtube")
++            ie.set_downloader(ydl)
++            ie.initialize()
++            return list(ie._get_requested_clients("https://www.youtube.com/watch?v=aqz-KE-bpKQ", {}, False))
++
++    def test_signed_in_sessions_never_request_the_rejected_client(self):
++        clients = self.requested_clients(signed_in=True)
++        self.assertNotIn("tv_downgraded", clients)
++        self.assertTrue(clients, "no clients requested")
++
++    def test_signed_out_default_still_avoids_the_rejected_client(self):
++        self.assertNotIn("tv_downgraded", self.requested_clients(signed_in=False))
++
++    def test_extractor_args_depend_on_bundled_ytdlp_version(self):
++        excluded = {"youtube": {"player_client": ["default", "-tv_downgraded"]}}
++        self.assertEqual(app.youtube_extractor_args("2026.08.19"), excluded)
++        self.assertEqual(app.youtube_extractor_args("2026.9.30"), excluded)
++        self.assertEqual(app.youtube_extractor_args("2026.10.10.233141"), {})
++        self.assertEqual(app.youtube_extractor_args("2026.10.10"), {})
++        self.assertEqual(app.youtube_extractor_args("2026.11.2"), {})
++        self.assertEqual(app.version_tuple("2026.10.10.233141.dev0"), (2026, 10, 10, 233141))
++
++    def test_non_youtube_urls_get_no_youtube_arguments(self):
++        self.assertNotIn("extractor_args", app.ytdlp_options("https://example.com/video.mp4", 20))
++        self.assertEqual(app.ytdlp_options("https://youtu.be/aqz-KE-bpKQ", 20)["extractor_args"], app.youtube_extractor_args())
++
++
++class FakeYoutubeDL:
++    """Stands in for DiagnosticYoutubeDL: records options, returns canned results, no network."""
++    instances = []
++
++    def __init__(self, options):
++        self.options = options
++        self.cookiejar = object()
++        FakeYoutubeDL.instances.append(self)
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *_):
++        return False
++
++    def extract_info(self, url, download=False):
++        return {"id": "aqz-KE-bpKQ", "title": "Test", "extractor_key": "Youtube", "duration": 5,
++                "formats": [{"format_id": "18", "ext": "mp4", "height": 360, "vcodec": "avc1", "acodec": "mp4a", "__yt_dlp_client": "web_embedded"}]}
++
++    def download(self, urls):
++        folder = Path(self.options["outtmpl"]).parent
++        prefix = Path(self.options["outtmpl"]).name[:10]
++        (folder / f"{prefix} Test [aqz-KE-bpKQ].mp4").write_bytes(b"data")
++        return 0
++
++
++class YouTubeApiPathTests(unittest.TestCase):
++    URL = "https://www.youtube.com/watch?v=aqz-KE-bpKQ&list=private"
++
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent)
++        self.addCleanup(self.temp.cleanup)
++        self.saved = (app.APP_DATA, app.STATE_FILE)
++        app.APP_DATA = Path(self.temp.name)
++        app.STATE_FILE = app.APP_DATA / "state.json"
++        self.records = []
++        FakeYoutubeDL.instances = []
++        patches = [
++            unittest.mock.patch.object(app, "DiagnosticYoutubeDL", FakeYoutubeDL),
++            unittest.mock.patch.object(app, "log_stage", lambda *a, **k: self.records.append(a)),
++            unittest.mock.patch.object(app, "valid_url", lambda value: value),
++            unittest.mock.patch.object(app, "ensure_writable_temp_dir", lambda: Path(self.temp.name)),
++            unittest.mock.patch.object(app, "resolve_browser_cookie_profile", lambda browser: ("PROFILE", "DB")),
++            unittest.mock.patch.object(app, "load_cookie_jar_for_diagnostics", lambda ydl, browser: None),
++        ]
++        for patch in patches:
++            patch.start()
++            self.addCleanup(patch.stop)
++        self.api = app.VidoSwiftApi()
++        self.api._ready_event.wait(3)
++        self.addCleanup(self.api._close)
++        self.addCleanup(lambda: setattr(app, "APP_DATA", self.saved[0]) or setattr(app, "STATE_FILE", self.saved[1]))
++        self.folder = Path(self.temp.name) / "downloads"
++        self.folder.mkdir()
++        self.api._state["settings"]["folder"] = str(self.folder)
++
++    def run_download(self, url):
++        job = {"id": "abcdef0123456789", "url": url, "title": "t", "quality": "best", "format": "mp4",
++               "folder": str(self.folder), "status": "Queued", "progress": 0, "speed": "", "eta": "",
++               "filepath": "", "error": "", "created": 0}
++        self.api._state["jobs"].insert(0, job)
++        self.api._download(job["id"])
++        return self.api._state["jobs"][0]
++
++    def test_analysis_and_download_use_identical_youtube_configuration(self):
++        self.assertTrue(self.api.analyze(self.URL)["ok"])
++        self.assertEqual(self.run_download(self.URL)["status"], "Completed")
++        analysis, download = FakeYoutubeDL.instances
++        for key in ("extractor_args", "noplaylist", "quiet", "no_warnings", "noprogress"):
++            self.assertEqual(analysis.options.get(key), download.options.get(key), key)
++        self.assertEqual(analysis.options["extractor_args"], app.youtube_extractor_args())
++        self.assertIsInstance(analysis.options["logger"], app.DiagnosticLogger)
++        self.assertIsInstance(download.options["logger"], app.DiagnosticLogger)
++
++    def test_cookies_are_off_unless_enabled_and_chosen_and_apply_to_both_paths(self):
++        self.api.analyze(self.URL)
++        self.run_download(self.URL)
++        self.assertTrue(all("cookiesfrombrowser" not in i.options for i in FakeYoutubeDL.instances))
++        FakeYoutubeDL.instances.clear()
++        self.api.save_settings({"youtube_cookies_enabled": True, "youtube_cookies_browser": "firefox"})
++        self.api.analyze(self.URL)
++        self.run_download(self.URL)
++        self.assertEqual([i.options["cookiesfrombrowser"] for i in FakeYoutubeDL.instances], [("firefox", "PROFILE", None, None)] * 2)
++        FakeYoutubeDL.instances.clear()
++        self.api.analyze("https://example.com/video.mp4")  # consent is YouTube-only
++        self.assertNotIn("cookiesfrombrowser", FakeYoutubeDL.instances[0].options)
++
++    def test_diagnostics_identify_build_version_config_and_clients_without_secrets(self):
++        self.api.save_settings({"youtube_cookies_enabled": True, "youtube_cookies_browser": "firefox"})
++        self.api.analyze(self.URL)
++        text = "\n".join(" ".join(str(part) for part in record) for record in self.records)
++        self.assertIn("app_version=" + app.APP_BUILD_VERSION, text)
++        self.assertIn("yt_dlp=" + app.YT_DLP_VERSION, text)
++        self.assertIn("video_id=aqz-KE-bpKQ", text)
++        self.assertIn("domain=www.youtube.com", text)
++        self.assertIn("cookie_mode=browser:firefox", text)
++        self.assertIn("web_embedded", text)  # clients_used
++        self.assertNotIn("list=private", text)
++
++    def test_page_needs_to_be_reloaded_is_translated_not_echoed(self):
++        raw = "ERROR: [youtube] m0Xbd0DI458: The page needs to be reloaded."
++        message = app.VidoSwiftApi._message(RuntimeError(raw), "firefox")
++        self.assertNotIn("ERROR:", message)
++        self.assertIn("cannot bypass", message.lower())
++        self.assertIn(app.YT_DLP_VERSION, message)
++        self.assertNotIn("cookie database", message.lower())
++
++    def test_extractor_failure_reaches_the_ui_as_translated_error_and_is_logged_with_traceback(self):
++        def boom(self, url, download=False):
++            raise RuntimeError("ERROR: [youtube] m0Xbd0DI458: The page needs to be reloaded.")
++        with unittest.mock.patch.object(FakeYoutubeDL, "extract_info", boom):
++            result = self.api.analyze("https://www.youtube.com/watch?v=m0Xbd0DI458")
++        self.assertFalse(result["ok"])
++        self.assertIn("YouTube rejected", result["error"])
++
++
++class DiagnosticLoggerTests(unittest.TestCase):
++    def test_playability_lines_are_kept_without_verbose_and_noise_is_dropped(self):
++        records = []
++        with unittest.mock.patch.object(app, "log_stage", lambda *a, **k: records.append(a)):
++            logger = app.DiagnosticLogger()
++            with app.DiagnosticYoutubeDL({"logger": logger, "quiet": True}) as ydl:
++                ydl.write_debug("[youtube] m0Xbd0DI458: tv_downgraded player response playability status: UNPLAYABLE")
++                ydl.write_debug("[youtube] unrelated debug line")
++                ydl.to_screen("[youtube] m0Xbd0DI458: Downloading tv downgraded player API JSON")
++                ydl.to_screen("[youtube] m0Xbd0DI458: Downloading webpage")
++                ydl.report_warning("Cookie: SID=private-value; https://x.example/a?token=private-token")
++        text = " ".join(" ".join(map(str, r)) for r in records)
++        self.assertIn("playability status: UNPLAYABLE", text)
++        self.assertIn("player API JSON", text)
++        self.assertNotIn("unrelated", text)
++        self.assertNotIn("Downloading webpage", text)
++        self.assertNotIn("private-value", text)
++        self.assertNotIn("private-token", text)
++
++    def test_home_directory_is_redacted_from_paths(self):
++        home = str(Path.home())
++        self.assertEqual(app.redact_home(f"{home}/AppData/Cookies"), "~/AppData/Cookies")
++        self.assertEqual(app.youtube_video_id("https://youtu.be/m0Xbd0DI458?t=3"), "m0Xbd0DI458")
++        self.assertEqual(app.youtube_video_id("https://example.com/x"), "unknown")
++
++
++class LocalNonYouTubeRegressionTests(unittest.TestCase):
++    """Real yt-dlp (generic extractor) against a throwaway local HTTP server: proves the shared
++    options/logger/DiagnosticYoutubeDL still analyse and download an ordinary video with no
++    internet, credentials or YouTube involved. valid_url is bypassed only because it
++    (correctly) refuses 127.0.0.1 in production."""
++
++    def test_metadata_and_download_of_a_direct_media_url(self):
++        import http.server
++        import socketserver
++
++        payload = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 4096
++
++        class Handler(http.server.BaseHTTPRequestHandler):
++            def _headers(self):
++                self.send_response(200)
++                self.send_header("Content-Type", "video/mp4")
++                self.send_header("Content-Length", str(len(payload)))
++                self.end_headers()
++            def do_HEAD(self): self._headers()
++            def do_GET(self):
++                self._headers()
++                self.wfile.write(payload)
++            def log_message(self, *args): pass
++
++        server = socketserver.TCPServer(("127.0.0.1", 0), Handler)
++        threading.Thread(target=server.serve_forever, daemon=True).start()
++        self.addCleanup(server.server_close)
++        self.addCleanup(server.shutdown)
++        url = f"http://127.0.0.1:{server.server_address[1]}/sample.mp4"
++        temp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent)
++        self.addCleanup(temp.cleanup)
++        saved = (app.APP_DATA, app.STATE_FILE)
++        app.APP_DATA, app.STATE_FILE = Path(temp.name), Path(temp.name) / "state.json"
++        self.addCleanup(lambda: (setattr(app, "APP_DATA", saved[0]), setattr(app, "STATE_FILE", saved[1])))
++        folder = Path(temp.name) / "out"
++        folder.mkdir()
++        with unittest.mock.patch.dict("os.environ", {"NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1", "HTTP_PROXY": "", "http_proxy": ""}), \
++             unittest.mock.patch.object(app, "valid_url", lambda value: value), \
++             unittest.mock.patch.object(app, "ensure_writable_temp_dir", lambda: Path(temp.name)):
++            api = app.VidoSwiftApi()
++            self.addCleanup(api._close)
++            api._ready_event.wait(3)
++            api._state["settings"]["folder"] = str(folder)
++            analysis = api.analyze(url)
++            self.assertTrue(analysis["ok"], analysis)
++            self.assertEqual(analysis["video"]["extractor"], "Generic")
++            self.assertTrue(analysis["video"]["title"])
++            job = {"id": "feedface00112233", "url": url, "title": "t", "quality": "best", "format": "mp4",
++                   "folder": str(folder), "status": "Queued", "progress": 0, "speed": "", "eta": "",
++                   "filepath": "", "error": "", "created": 0}
++            api._state["jobs"].insert(0, job)
++            api._download(job["id"])
++            self.assertEqual(api._state["jobs"][0]["status"], "Completed", api._state["jobs"][0].get("error"))
++            self.assertTrue(Path(api._state["jobs"][0]["filepath"]).stat().st_size > 0)
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff -ruN a/build.ps1 b/build.ps1
+--- a/build.ps1	2026-10-18 04:17:22.000000000 +0600
++++ b/build.ps1	2026-10-18 14:17:29.900695890 +0600
+@@ -45,6 +45,10 @@
+     if (-not $buildMatch.Success) { throw "APP_BUILD_VERSION is missing from backend/app.py." }
+     $ytDlpVersion = & $python -c "from yt_dlp.version import __version__; print(__version__)"
+     if ($LASTEXITCODE -ne 0) { throw "Could not read the bundled yt-dlp version." }
++    $ytDlpHasFix = & $python -c "import re; from yt_dlp.version import __version__ as v; print(int(tuple(int(p) for p in re.findall(r'\d+', v)[:4]) >= (2026, 10, 10)))"
++    if ($ytDlpHasFix.Trim() -ne "1") {
++        Write-Warning "Bundled yt-dlp $($ytDlpVersion.Trim()) predates the upstream YouTube 'tv_downgraded' fix (2026.10.10). app.py works around it by excluding that client; run tools\Refresh-YtDlpVendor.ps1 to bundle the upstream fix."
++    }
+     $metadataDir = Join-Path $root "work\package-metadata"
+     New-Item -ItemType Directory -Path $metadataDir -Force | Out-Null
+     $buildInfoPath = Join-Path $metadataDir ("vidoswift-build-info-{0}.json" -f [guid]::NewGuid().ToString("N"))
+diff -ruN a/tools/Refresh-YtDlpVendor.ps1 b/tools/Refresh-YtDlpVendor.ps1
+--- a/tools/Refresh-YtDlpVendor.ps1	1970-01-01 06:00:00.000000000 +0600
++++ b/tools/Refresh-YtDlpVendor.ps1	2026-10-18 14:17:29.906201748 +0600
+@@ -0,0 +1,33 @@
++<#
++.SYNOPSIS
++  Replace backend\vendor with a complete, dependency-consistent copy of the yt-dlp pinned in
++  backend\requirements.txt (default: 2026.10.10.233141.dev0, the first build containing the
++  upstream fix for "The page needs to be reloaded", yt-dlp #17389 / PRs #17723, #17805).
++
++.DESCRIPTION
++  Installs the pinned requirement (with its [default] extras: yt-dlp-ejs, websockets, requests,
++  certifi, pycryptodomex, brotli, mutagen, ...) into a fresh folder with pip, checks the version,
++  then swaps it in. The old vendor folder is kept as backend\vendor.backup-<timestamp>.
++  Replacing only extractor\youtube\_base.py/_video.py would be an incomplete refresh: the
++  2026.08.19 -> 2026.10.10 change touches 32 files (YoutubeDL.py, utils, networking, ...).
++  Run build.ps1 afterwards: it runs the tests and rebuilds the EXE.
++#>
++param([string]$Python = $env:VIDOSWIFT_PYTHON)
++$ErrorActionPreference = "Stop"
++$root = Split-Path -Parent $PSScriptRoot
++$backend = Join-Path $root "backend"
++if (-not $Python -or -not (Test-Path -LiteralPath $Python)) { throw "Set VIDOSWIFT_PYTHON (or pass -Python) to a Python 3.10+ executable." }
++$pin = (Get-Content -LiteralPath (Join-Path $backend "requirements.txt") | Where-Object { $_ -match '^\s*yt-dlp\[' } | Select-Object -First 1).Trim()
++if (-not $pin) { throw "No yt-dlp requirement found in backend\requirements.txt." }
++$expected = ([regex]::Match($pin, '==\s*([^\s;]+)')).Groups[1].Value
++$stamp = Get-Date -Format "yyyyMMdd-HHmmss"
++$fresh = Join-Path $backend "vendor.new-$stamp"
++$vendor = Join-Path $backend "vendor"
++& $Python -m pip install --disable-pip-version-check --target $fresh $pin
++if ($LASTEXITCODE -ne 0) { throw "pip could not install $pin." }
++$installed = & $Python -c "import sys; sys.path.insert(0, r'$fresh'); import yt_dlp.version as v; print(v.__version__.split('.dev')[0])"
++if ($LASTEXITCODE -ne 0 -or -not $installed) { throw "The refreshed vendor folder does not import yt_dlp." }
++if ($expected -and -not ($expected -like "$($installed.Trim())*")) { throw "Installed yt-dlp $installed does not match the pin $expected." }
++if (Test-Path -LiteralPath $vendor) { Move-Item -LiteralPath $vendor -Destination (Join-Path $backend "vendor.backup-$stamp") }
++Move-Item -LiteralPath $fresh -Destination $vendor
++Write-Output "Vendored yt-dlp $installed from '$pin'. Previous vendor kept as backend\vendor.backup-$stamp. Now run .\build.ps1"
+diff -ruN a/tools/client_selection.py b/tools/client_selection.py
+--- a/tools/client_selection.py	1970-01-01 06:00:00.000000000 +0600
++++ b/tools/client_selection.py	2026-10-18 14:17:50.783553542 +0600
+@@ -0,0 +1,30 @@
++"""Offline: which YouTube player clients does yt-dlp request for a given config?
++No network. Fake cookies only mark the session as 'signed in' for yt-dlp's own check."""
++import sys, json
++from http.cookiejar import Cookie
++import yt_dlp
++from yt_dlp import YoutubeDL
++from yt_dlp.extractor.youtube import YoutubeIE
++
++def cookie(name):
++    return Cookie(0, name, "x", None, False, ".youtube.com", True, True, "/", True, True, None, False, None, None, {})
++
++def requested(authed, args=None):
++    opts = {"quiet": True, "logger": type("L", (), {"debug": lambda *a: 0, "warning": lambda *a: 0, "error": lambda *a: 0})()}
++    if args: opts["extractor_args"] = {"youtube": args}
++    with YoutubeDL(opts) as ydl:
++        if authed:
++            for n in ("LOGIN_INFO", "SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID"):
++                ydl.cookiejar.set_cookie(cookie(n))
++        ie = ydl.get_info_extractor("Youtube")
++        ie.set_downloader(ydl); ie.initialize()
++        return list(ie._get_requested_clients("https://www.youtube.com/watch?v=x", {}, False)), ie.is_authenticated
++
++print("yt-dlp", yt_dlp.version.__version__, yt_dlp.version.CHANNEL)
++for label, authed, args in [
++    ("no cookies, default config", False, None),
++    ("cookies (signed in), default config", True, None),
++    ("cookies, player_client=default,-tv_downgraded", True, {"player_client": ["default", "-tv_downgraded"]}),
++]:
++    clients, auth = requested(authed, args)
++    print(f"  {label:50s} authed={auth!s:5} -> {clients}")
