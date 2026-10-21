@@ -1,15 +1,24 @@
-# VidoSwift Mobile
+# VidoSwift mobile projects
 
-This directory is the isolated Android/API workspace. The Windows desktop project remains in the repository root and is not imported or edited by the mobile service.
+This folder contains the Android client and its FastAPI service. The desktop application at the repository root remains separate.
 
-## Initial architecture
+## Android client
 
-- `android-app/` will use Capacitor with React/Vite. It will keep a mobile-specific API adapter instead of `window.pywebview.api`, and carry its own mobile layout while reusing VidoSwift design tokens and assets.
-- `api/` is a FastAPI service. Its analysis path uses the repository's pinned yt-dlp version and YouTube client compatibility logic. It is independent of pywebview and desktop settings.
-- A later phase will add authenticated download jobs, a Redis-backed worker, temporary file storage with expiry, and a short-lived download URL. The Android app will save completed files through Android's system download/storage APIs.
+`android-app/` is the Expo / React Native app copied from the Google AI Studio source supplied for this project. It targets Expo SDK 57 and uses the API configured in `android-app/src/config.ts` (default: `https://vidoswift.onrender.com`). Set `EXPO_PUBLIC_API_BASE_URL` at build time to use another service.
 
-## Phase 1–2 status
+From PowerShell:
 
-The initial API service currently provides `GET /v1/health` and `POST /v1/analyze`, public URL validation, a version-aware YouTube client selection, and optional Node.js 22+ discovery for yt-dlp JavaScript challenges. See [`api/README.md`](api/README.md) for local development and the current limitations.
+```powershell
+cd mobile/android-app
+npm.cmd ci
+npm.cmd run typecheck
+npm.cmd start
+```
 
-Do not expose this initial service to the public internet yet. Authentication, per-user quotas/rate limits, durable download jobs, server egress controls, and temporary-file cleanup are required before public deployment. Browser cookie values are not accepted by this API.
+Scan the Expo QR code with a compatible Expo Go installation. To create a standalone Android APK using the included EAS preview profile, configure EAS for the project, then run `eas build --platform android --profile preview`.
+
+The app calls `POST /v1/analyze`, streams downloads with `GET /v1/download`, and checks `GET /v1/health`. Downloadable audio-only entries are excluded because the current API download endpoint accepts video quality selections.
+
+## API service
+
+`api/` is the FastAPI service. See [`api/README.md`](api/README.md) for dependencies, local startup, endpoints, safety limits, and deployment notes. The Render YouTube extraction failure is not considered resolved until a deployed Analyze request returns HTTP 200 with metadata and formats.

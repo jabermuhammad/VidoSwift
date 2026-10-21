@@ -1,0 +1,36 @@
+{
+  "expo": {
+    "name": "VidoSwift",
+    "slug": "vidoswift-download-studio",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "plugins": [
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash.png",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#111116"
+        }
+      ]
+    ],
+    "android": {
+      "package": "com.vidoswift.downloadstudio",
+      "versionCode": 1,
+      "permissions": [
+        "INTERNET",
+        "ACCESS_NETWORK_STATE"
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#111116"
+      }
+    },
+    "extra": {
+      "apiBaseUrl": "https://vidoswift.onrender.com"
+    }
+  }
+}

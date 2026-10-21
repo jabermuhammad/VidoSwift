@@ -40,7 +40,7 @@ $env:VIDOSWIFT_CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173,https
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-For YouTube JavaScript challenges, install Node.js 22+ on the API host and make `node` available on `PATH`; alternatively set `VIDOSWIFT_NODE` to its executable. The service records only whether that runtime is available, not its path.
+For YouTube JavaScript challenges, install Node.js 22+ on the API host and make `node` available on `PATH`; alternatively set `VIDOSWIFT_NODE` to the full path of the Node executable. `VIDOSWIFT_NODE` is a filesystem path setting, not an API key or secret. If it does not point to an executable file, the service falls back to searching `PATH`. The service records only whether a supported runtime is available, not its path. A JavaScript runtime does not guarantee YouTube will provide a player response.
 
 ## Safety and deployment boundary
 
