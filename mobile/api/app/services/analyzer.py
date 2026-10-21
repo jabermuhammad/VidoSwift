@@ -17,11 +17,11 @@ from app.security.url_validation import validate_public_video_url
 logger = logging.getLogger("vidoswift.mobile_api.analyzer")
 YOUTUBE_FIX_VERSION = (2026, 10, 10)
 YOUTUBE_AUTH_ERRORS = (
-    "sign in",
     "login_required",
-    "not a bot",
-    "confirm you're not",
-    "confirm you’re not",
+    "private video",
+    "members-only",
+    "members only",
+    "age-restricted",
 )
 
 
@@ -115,6 +115,70 @@ def _size_text(value) -> str:
     return "Unavailable"
 
 
+def _analysis_failure(exc: Exception) -> AnalysisError:
+    """Translate yt-dlp failures without labeling every YouTube rejection as login-only."""
+    message = str(exc).lower()
+    if "sign in to confirm" in message and any(marker in message for marker in ("not a bot", "you're not", "you’re not")):
+        return AnalysisError(
+            "youtube_request_blocked",
+            "YouTube refused this server's unauthenticated request. This can affect public videos and does not prove the video needs sign-in. Retry later; browser cookies are not automatically required.",
+            status_code=503,
+            retryable=True,
+        )
+    if "429" in message or "too many requests" in message:
+        return AnalysisError(
+            "source_rate_limited",
+            "YouTube is rate-limiting requests from this server. Wait before retrying.",
+            status_code=429,
+            retryable=True,
+        )
+    if "403" in message or "forbidden" in message or "po token" in message:
+        return AnalysisError(
+            "youtube_request_blocked",
+            "YouTube rejected this server's request. This may be caused by server network restrictions or a format-token requirement; it does not necessarily mean the video requires sign-in.",
+            status_code=503,
+            retryable=True,
+        )
+    if any(marker in message for marker in ("javascript runtime", "js challenge", "could not find a javascript runtime")):
+        return AnalysisError(
+            "javascript_runtime_required",
+            "YouTube extraction needs a supported JavaScript runtime. Install Node.js 22 or newer on the backend and restart it.",
+            status_code=503,
+        )
+    if any(marker in message for marker in ("failed to resolve", "name or service not known", "temporary failure in name resolution")):
+        return AnalysisError(
+            "source_network_error",
+            "The backend could not resolve or reach YouTube. Check DNS and outbound network access on the server.",
+            status_code=503,
+            retryable=True,
+        )
+    if any(marker in message for marker in YOUTUBE_AUTH_ERRORS):
+        return AnalysisError(
+            "authentication_required",
+            "YouTube reports that this video is restricted and may require an authorized signed-in session.",
+            status_code=422,
+        )
+    if "no formats" in message or "requested format is not available" in message:
+        return AnalysisError(
+            "formats_unavailable",
+            "YouTube returned no formats usable by this server. The video may be region-restricted, require a format token, or be temporarily unavailable.",
+            status_code=422,
+            retryable=True,
+        )
+    if "timed out" in message or isinstance(exc, TimeoutError):
+        return AnalysisError(
+            "analysis_timeout",
+            "Video analysis timed out. Retry the request.",
+            status_code=504,
+            retryable=True,
+        )
+    return AnalysisError(
+        "analysis_failed",
+        "The video platform did not return usable video information.",
+        retryable=True,
+    )
+
+
 def analyze_video(raw_url: str) -> dict:
     url = validate_public_video_url(raw_url)
     is_youtube = youtube_host(url)
@@ -138,26 +202,14 @@ def analyze_video(raw_url: str) -> dict:
         with YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
-        message = str(exc).lower()
-        logger.warning("video analysis failed host=%s exception_type=%s", urlparse(url).hostname, type(exc).__name__)
-        if any(marker in message for marker in YOUTUBE_AUTH_ERRORS):
-            raise AnalysisError(
-                "authentication_required",
-                "The platform requires a signed-in session or does not allow this request.",
-                status_code=422,
-            ) from exc
-        if "timed out" in message or isinstance(exc, TimeoutError):
-            raise AnalysisError(
-                "analysis_timeout",
-                "Video analysis timed out. Retry the request.",
-                status_code=504,
-                retryable=True,
-            ) from exc
-        raise AnalysisError(
-            "analysis_failed",
-            "The video platform did not return usable video information.",
-            retryable=True,
-        ) from exc
+        failure = _analysis_failure(exc)
+        logger.warning(
+            "video analysis failed host=%s failure_code=%s exception_type=%s",
+            urlparse(url).hostname,
+            failure.code,
+            type(exc).__name__,
+        )
+        raise failure from exc
 
     if not info:
         raise AnalysisError("analysis_failed", "The video platform returned no video information.")
