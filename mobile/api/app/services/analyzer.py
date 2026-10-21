@@ -25,6 +25,41 @@ YOUTUBE_AUTH_ERRORS = (
 )
 
 
+class _YtDlpDiagnostics:
+    """Collect only safe event labels; never retain yt-dlp's raw debug text."""
+
+    _EVENTS = (
+        ("po_token", re.compile(r"po token", re.I)),
+        ("bot_or_consent_check", re.compile(r"not a bot|consent", re.I)),
+        ("rate_limit", re.compile(r"429|too many requests", re.I)),
+        ("forbidden", re.compile(r"403|forbidden", re.I)),
+        ("player_response_missing", re.compile(r"failed to extract any player response", re.I)),
+        ("player_api_request", re.compile(r"player api", re.I)),
+        ("webpage_request", re.compile(r"downloading webpage", re.I)),
+        ("js_runtime", re.compile(r"javascript runtime|js challenge", re.I)),
+    )
+
+    def __init__(self) -> None:
+        self.events: set[str] = set()
+
+    def _record(self, message: str) -> None:
+        for label, pattern in self._EVENTS:
+            if pattern.search(message):
+                self.events.add(label)
+
+    def debug(self, message: str) -> None:
+        self._record(message)
+
+    def info(self, message: str) -> None:
+        self._record(message)
+
+    def warning(self, message: str) -> None:
+        self._record(message)
+
+    def error(self, message: str) -> None:
+        self._record(message)
+
+
 class AnalysisError(Exception):
     def __init__(self, code: str, message: str, *, status_code: int = 502, retryable: bool = False):
         super().__init__(message)
@@ -118,10 +153,23 @@ def _size_text(value) -> str:
 def _analysis_failure(exc: Exception) -> AnalysisError:
     """Translate yt-dlp failures without labeling every YouTube rejection as login-only."""
     message = str(exc).lower()
+    if any(marker in message for marker in ("video unavailable", "video is unavailable", "has been removed", "this video does not exist")):
+        return AnalysisError(
+            "video_unavailable",
+            "YouTube reports that this video is unavailable. It may have been removed or restricted in this region.",
+            status_code=422,
+        )
     if "sign in to confirm" in message and any(marker in message for marker in ("not a bot", "you're not", "you’re not")):
         return AnalysisError(
             "youtube_request_blocked",
             "YouTube refused this server's unauthenticated request. This can affect public videos and does not prove the video needs sign-in. Retry later; browser cookies are not automatically required.",
+            status_code=503,
+            retryable=True,
+        )
+    if "consent" in message and any(marker in message for marker in ("required", "confirm", "cookie")):
+        return AnalysisError(
+            "youtube_consent_required",
+            "YouTube returned a consent check that this server cannot complete. Retry later; this does not prove the video itself requires sign-in.",
             status_code=503,
             retryable=True,
         )
@@ -130,6 +178,20 @@ def _analysis_failure(exc: Exception) -> AnalysisError:
             "source_rate_limited",
             "YouTube is rate-limiting requests from this server. Wait before retrying.",
             status_code=429,
+            retryable=True,
+        )
+    if "po token" in message and any(word in message for word in ("required", "missing", "unavailable", "needed")):
+        return AnalysisError(
+            "po_token_required",
+            "YouTube requires a format access token for this extraction path. This server is not configured with one; retrying or changing video quality may help when YouTube offers another format.",
+            status_code=503,
+            retryable=True,
+        )
+    if "failed to extract any player response" in message:
+        return AnalysisError(
+            "youtube_player_response_missing",
+            "YouTube did not return a usable player response. This can result from a temporary extractor, consent, verification, or network issue; it does not by itself indicate a private video or confirm IP blocking.",
+            status_code=503,
             retryable=True,
         )
     if "403" in message or "forbidden" in message or "po token" in message:
@@ -195,6 +257,10 @@ def analyze_video(raw_url: str) -> dict:
     }
     if is_youtube:
         options["extractor_args"] = youtube_extractor_args()
+        diagnostics = _YtDlpDiagnostics()
+        options["logger"] = diagnostics
+        # Enable yt-dlp debug callbacks, but retain only the safe labels above.
+        options["verbose"] = True
         if runtime := find_youtube_js_runtime():
             options["js_runtimes"] = {"node": {"path": runtime}}
 
@@ -204,10 +270,11 @@ def analyze_video(raw_url: str) -> dict:
     except Exception as exc:
         failure = _analysis_failure(exc)
         logger.warning(
-            "video analysis failed host=%s failure_code=%s exception_type=%s",
+            "video analysis failed host=%s failure_code=%s exception_type=%s yt_dlp_events=%s",
             urlparse(url).hostname,
             failure.code,
             type(exc).__name__,
+            ",".join(sorted(diagnostics.events)) if is_youtube else "",
         )
         raise failure from exc
 
