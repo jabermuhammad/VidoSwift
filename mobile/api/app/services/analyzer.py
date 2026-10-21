@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections.abc import Iterator
 from functools import lru_cache
 from urllib.parse import urlparse
 
@@ -34,8 +35,8 @@ class _YtDlpDiagnostics:
     """
 
     _EVENTS = (
-        ("http_429_error_signature", re.compile(r"\bhttp\s+error\s+429\s*:\s*too many requests\b", re.I)),
-        ("http_403_error_signature", re.compile(r"\bhttp\s+error\s+403\s*:\s*forbidden\b", re.I)),
+        ("http_error_text_match_429", re.compile(r"\bhttp\s+error\s+429\s*:\s*too many requests\b", re.I)),
+        ("http_error_text_match_403", re.compile(r"\bhttp\s+error\s+403\s*:\s*forbidden\b", re.I)),
         ("bot_verification_message", re.compile(r"sign in to confirm.{0,80}not a bot|not a bot", re.I)),
         ("consent_message", re.compile(r"consent.{0,80}(?:required|needed|confirm)|(?:required|needed).{0,80}consent", re.I)),
         ("po_token_requirement_observed", re.compile(r"po token.{0,80}\b(?:required|missing|needed)\b|\b(?:required|missing|needed)\b.{0,80}po token", re.I)),
@@ -163,9 +164,61 @@ def _size_text(value) -> str:
     return "Unavailable"
 
 
+def _exception_chain(exc: BaseException) -> Iterator[BaseException]:
+    """Yield wrapped yt-dlp exceptions and their underlying causes safely."""
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        for linked in (getattr(current, "cause", None), current.__cause__, current.__context__):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+        exc_info = getattr(current, "exc_info", None)
+        if isinstance(exc_info, tuple) and len(exc_info) > 1 and isinstance(exc_info[1], BaseException):
+            pending.append(exc_info[1])
+
+
+def _http_status_from_exception(exc: BaseException) -> int | None:
+    """Return only a status carried by a structured response/HTTP exception."""
+    for item in _exception_chain(exc):
+        candidates = (
+            getattr(item, "code", None),
+            getattr(item, "status", None),
+            getattr(item, "status_code", None),
+            getattr(getattr(item, "response", None), "status_code", None),
+        )
+        for value in candidates:
+            if isinstance(value, int) and 100 <= value <= 599:
+                return value
+    return None
+
+
+def _failure_stage(exc: BaseException, events: list[str]) -> str:
+    """Report the stage named by the exception, falling back to observed attempts."""
+    messages = " ".join(str(item).lower() for item in _exception_chain(exc))
+    if "failed to extract any player response" in messages:
+        return "player_response"
+    if "unable to extract initial player response" in messages:
+        return "initial_player_response"
+    if "unable to extract player version" in messages:
+        return "player_version"
+    if "player_api_attempted" in events:
+        return "player_api"
+    if "webpage_request_attempted" in events:
+        return "webpage"
+    if "js_challenge_mentioned" in events:
+        return "javascript_challenge"
+    return "unknown"
+
+
 def _analysis_failure(exc: Exception) -> AnalysisError:
     """Translate yt-dlp failures without labeling every YouTube rejection as login-only."""
     message = str(exc).lower()
+    http_status = _http_status_from_exception(exc)
     if any(marker in message for marker in ("video unavailable", "video is unavailable", "has been removed", "this video does not exist")):
         return AnalysisError(
             "video_unavailable",
@@ -186,11 +239,18 @@ def _analysis_failure(exc: Exception) -> AnalysisError:
             status_code=503,
             retryable=True,
         )
-    if re.search(r"http\s+error\s+429\s*:\s*too many requests|too many requests", message):
+    if http_status == 429:
         return AnalysisError(
             "source_rate_limited",
             "YouTube is rate-limiting requests from this server. Wait before retrying.",
             status_code=429,
+            retryable=True,
+        )
+    if http_status == 403:
+        return AnalysisError(
+            "youtube_request_blocked",
+            "YouTube rejected an extraction request. This may be a temporary platform or network restriction and does not necessarily mean the video requires sign-in.",
+            status_code=503,
             retryable=True,
         )
     if "po token" in message and any(word in message for word in ("required", "missing", "unavailable", "needed")):
@@ -204,13 +264,6 @@ def _analysis_failure(exc: Exception) -> AnalysisError:
         return AnalysisError(
             "youtube_player_response_missing",
             "YouTube did not return a usable player response. This can result from a temporary extractor, consent, verification, or network issue; it does not by itself indicate a private video or confirm IP blocking.",
-            status_code=503,
-            retryable=True,
-        )
-    if re.search(r"http\s+error\s+403\s*:\s*forbidden", message) or "po token" in message:
-        return AnalysisError(
-            "youtube_request_blocked",
-            "YouTube rejected this server's request. This may be caused by server network restrictions or a format-token requirement; it does not necessarily mean the video requires sign-in.",
             status_code=503,
             retryable=True,
         )
@@ -282,27 +335,22 @@ def analyze_video(raw_url: str) -> dict:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
         failure = _analysis_failure(exc)
-        http_signatures = ",".join(
-            signature for event, signature in (
-                ("http_429_error_signature", "429"),
-                ("http_403_error_signature", "403"),
+        http_status = _http_status_from_exception(exc)
+        http_text_matches = ",".join(
+            code for event, code in (
+                ("http_error_text_match_429", "429"),
+                ("http_error_text_match_403", "403"),
             ) if is_youtube and event in diagnostics.events
-        ) if is_youtube else "none"
-        final_stage = next((
-            stage for label, stage in (
-                ("player_response_missing", "player_response"),
-                ("player_api_attempted", "player_api"),
-                ("webpage_request_attempted", "webpage"),
-                ("js_challenge_mentioned", "javascript_challenge"),
-            ) if label in diagnostics.events
-        ), "unknown") if is_youtube else "unknown"
+        ) if is_youtube else ""
+        final_stage = _failure_stage(exc, diagnostics.events) if is_youtube else "unknown"
         logger.warning(
-            "video analysis failed host=%s failure_code=%s exception_type=%s yt_dlp_stage=%s yt_dlp_http_error_signatures=%s yt_dlp_events=%s",
+            "video analysis failed host=%s failure_code=%s exception_type=%s yt_dlp_stage_inferred=%s yt_dlp_http_status=%s yt_dlp_http_error_text_matches=%s yt_dlp_events=%s",
             urlparse(url).hostname,
             failure.code,
             type(exc).__name__,
             final_stage,
-            http_signatures or "none",
+            str(http_status) if http_status is not None else "unavailable",
+            http_text_matches or "none",
             ",".join(diagnostics.events) if is_youtube else "",
         )
         raise failure from exc

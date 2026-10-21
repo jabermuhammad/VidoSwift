@@ -1,11 +1,22 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.error import HTTPError
 from unittest.mock import MagicMock, patch
 
 from app import main
 from app.schemas import AnalyzeRequest
 from app.services.analyzer import AnalysisError, _analysis_failure, analyze_video, youtube_extractor_args
+from yt_dlp.utils import DownloadError as YtDlpDownloadError, ExtractorError
+
+
+def wrapped_ytdlp_http_error(status: int, message: str) -> YtDlpDownloadError:
+    response_error = HTTPError("https://www.youtube.com/youtubei/v1/player", status, message, {}, None)
+    extractor_error = ExtractorError("Failed to extract any player response", cause=response_error)
+    return YtDlpDownloadError(
+        str(extractor_error),
+        exc_info=(type(extractor_error), extractor_error, None),
+    )
 
 
 class AnalysisFailureTests(unittest.TestCase):
@@ -16,12 +27,12 @@ class AnalysisFailureTests(unittest.TestCase):
         self.assertIn("does not prove the video needs sign-in", failure.message)
 
     def test_format_403_does_not_claim_the_video_is_private(self):
-        failure = _analysis_failure(RuntimeError("HTTP Error 403: Forbidden"))
+        failure = _analysis_failure(wrapped_ytdlp_http_error(403, "Forbidden"))
         self.assertEqual(failure.code, "youtube_request_blocked")
         self.assertIn("does not necessarily mean the video requires sign-in", failure.message)
 
     def test_rate_limit_is_reported_separately(self):
-        failure = _analysis_failure(RuntimeError("HTTP Error 429: Too Many Requests"))
+        failure = _analysis_failure(wrapped_ytdlp_http_error(429, "Too Many Requests"))
         self.assertEqual(failure.code, "source_rate_limited")
         self.assertEqual(failure.status_code, 429)
 
@@ -60,6 +71,10 @@ class AnalysisFailureTests(unittest.TestCase):
         failure = _analysis_failure(RuntimeError("PO Token required for this client"))
         self.assertEqual(failure.code, "po_token_required")
 
+    def test_po_token_mention_alone_is_not_classified_as_a_requirement(self):
+        failure = _analysis_failure(RuntimeError("The extractor supports PO Token providers."))
+        self.assertEqual(failure.code, "analysis_failed")
+
     def test_current_yt_dlp_uses_library_default_clients_without_forced_embedded_request(self):
         self.assertEqual(youtube_extractor_args("2026.10.10"), {"youtube": {"player_client": ["default"]}})
         self.assertEqual(
@@ -86,7 +101,7 @@ class AnalysisFailureTests(unittest.TestCase):
     def test_analyzer_translates_rate_limit_and_logs_only_safe_event_labels(self):
         fake_ydl = MagicMock()
         fake_ydl.__enter__.return_value = fake_ydl
-        fake_ydl.extract_info.side_effect = RuntimeError("HTTP 429 Too Many Requests")
+        fake_ydl.extract_info.side_effect = wrapped_ytdlp_http_error(429, "Too Many Requests")
         with patch("app.services.analyzer.validate_public_video_url", return_value="https://youtube.com/watch?v=abc123"), \
              patch("app.services.analyzer.YoutubeDL", return_value=fake_ydl), \
              patch("app.services.analyzer.logger.warning") as warning:
@@ -94,9 +109,9 @@ class AnalysisFailureTests(unittest.TestCase):
                 analyze_video("https://youtube.com/watch?v=abc123")
         self.assertEqual(raised.exception.code, "source_rate_limited")
         self.assertEqual(warning.call_args.args[1:4], (
-            "youtube.com", "source_rate_limited", "RuntimeError",
+            "youtube.com", "source_rate_limited", "DownloadError",
         ))
-        self.assertEqual(warning.call_args.args[4:6], ("unknown", "none"))
+        self.assertEqual(warning.call_args.args[4:7], ("player_response", "429", "none"))
         self.assertNotIn("abc123", str(warning.call_args))
 
     def test_ytdlp_diagnostic_collector_keeps_only_safe_event_labels(self):
@@ -118,8 +133,8 @@ class AnalysisFailureTests(unittest.TestCase):
         self.assertIn("po_token_mentioned", diagnostics.events)
         self.assertIn("player_api_attempted", diagnostics.events)
         self.assertNotIn("po_token_requirement_observed", diagnostics.events)
-        self.assertNotIn("http_403_error_signature", diagnostics.events)
-        self.assertNotIn("http_429_error_signature", diagnostics.events)
+        self.assertNotIn("http_error_text_match_403", diagnostics.events)
+        self.assertNotIn("http_error_text_match_429", diagnostics.events)
         self.assertNotIn("js_runtime_unavailable", diagnostics.events)
         failure = _analysis_failure(RuntimeError("Failed to extract any player response"))
         self.assertEqual(failure.code, "youtube_player_response_missing")
@@ -131,12 +146,31 @@ class AnalysisFailureTests(unittest.TestCase):
         diagnostics.error("ERROR: HTTP Error 429: Too Many Requests")
         diagnostics.error("WARNING: A PO Token is required for this client")
 
-        self.assertIn("http_429_error_signature", diagnostics.events)
+        self.assertIn("http_error_text_match_429", diagnostics.events)
         self.assertIn("po_token_requirement_observed", diagnostics.events)
         # Earlier diagnostic lines in a multi-request extraction aren't enough
         # to claim that they caused a later generic player-response failure.
         failure = _analysis_failure(RuntimeError("Failed to extract any player response"))
         self.assertEqual(failure.code, "youtube_player_response_missing")
+
+    def test_http_text_signatures_are_not_treated_as_observed_status_codes(self):
+        from app.services.analyzer import _YtDlpDiagnostics, _http_status_from_exception
+
+        diagnostics = _YtDlpDiagnostics()
+        diagnostics.error("ERROR: HTTP Error 429: Too Many Requests")
+        diagnostics.error("ERROR: HTTP Error 403: Forbidden")
+        wrapped_missing_response = YtDlpDownloadError("Failed to extract any player response")
+
+        self.assertIn("http_error_text_match_429", diagnostics.events)
+        self.assertIn("http_error_text_match_403", diagnostics.events)
+        self.assertIsNone(_http_status_from_exception(wrapped_missing_response))
+        self.assertEqual(_analysis_failure(wrapped_missing_response).code, "youtube_player_response_missing")
+
+    def test_wrapped_structured_http_status_is_preserved_through_ytdlp_exceptions(self):
+        from app.services.analyzer import _http_status_from_exception
+
+        self.assertEqual(_http_status_from_exception(wrapped_ytdlp_http_error(403, "Forbidden")), 403)
+        self.assertEqual(_http_status_from_exception(wrapped_ytdlp_http_error(429, "Too Many Requests")), 429)
 
     def test_bot_consent_verification_and_unexpected_errors_are_safely_classified(self):
         self.assertEqual(
