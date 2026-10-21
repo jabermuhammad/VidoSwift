@@ -26,31 +26,39 @@ YOUTUBE_AUTH_ERRORS = (
 
 
 class _YtDlpDiagnostics:
-    """Collect only safe event labels; never retain yt-dlp's raw debug text."""
+    """Collect safe, evidence-specific signals without retaining raw yt-dlp text.
+
+    Request-stage labels mean yt-dlp attempted that stage. They do not mean the
+    request failed. Mentions of PO Tokens or JavaScript challenges are likewise
+    kept distinct from explicit requirements or missing-runtime errors.
+    """
 
     _EVENTS = (
-        ("po_token", re.compile(r"po token", re.I)),
-        ("bot_or_consent_check", re.compile(r"not a bot|consent", re.I)),
-        ("rate_limit", re.compile(r"429|too many requests", re.I)),
-        ("forbidden", re.compile(r"403|forbidden", re.I)),
+        ("http_429_error_signature", re.compile(r"\bhttp\s+error\s+429\s*:\s*too many requests\b", re.I)),
+        ("http_403_error_signature", re.compile(r"\bhttp\s+error\s+403\s*:\s*forbidden\b", re.I)),
+        ("bot_verification_message", re.compile(r"sign in to confirm.{0,80}not a bot|not a bot", re.I)),
+        ("consent_message", re.compile(r"consent.{0,80}(?:required|needed|confirm)|(?:required|needed).{0,80}consent", re.I)),
+        ("po_token_requirement_observed", re.compile(r"po token.{0,80}\b(?:required|missing|needed)\b|\b(?:required|missing|needed)\b.{0,80}po token", re.I)),
+        ("po_token_mentioned", re.compile(r"po token", re.I)),
+        ("js_runtime_unavailable", re.compile(r"no supported javascript runtime could be found|could not find (?:a )?javascript runtime|javascript runtime.{0,50}(?:not found|unavailable)", re.I)),
+        ("js_challenge_mentioned", re.compile(r"javascript challenge|js challenge", re.I)),
         ("player_response_missing", re.compile(r"failed to extract any player response", re.I)),
         ("initial_response_missing", re.compile(r"unable to extract initial player response", re.I)),
         ("player_version_missing", re.compile(r"unable to extract player version", re.I)),
         ("player_response_json_invalid", re.compile(r"failed to parse json|jsondecodeerror", re.I)),
         ("player_responses_invalid", re.compile(r"all player responses are invalid", re.I)),
         ("player_response_status_error", re.compile(r"player response playability status: (?:error|unplayable|login_required)", re.I)),
-        ("player_api_request", re.compile(r"player api", re.I)),
-        ("webpage_request", re.compile(r"downloading webpage", re.I)),
-        ("js_runtime", re.compile(r"javascript runtime|js challenge", re.I)),
+        ("player_api_attempted", re.compile(r"player api", re.I)),
+        ("webpage_request_attempted", re.compile(r"downloading webpage", re.I)),
     )
 
     def __init__(self) -> None:
-        self.events: set[str] = set()
+        self.events: list[str] = []
 
     def _record(self, message: str) -> None:
         for label, pattern in self._EVENTS:
-            if pattern.search(message):
-                self.events.add(label)
+            if pattern.search(message) and label not in self.events:
+                self.events.append(label)
 
     def debug(self, message: str) -> None:
         self._record(message)
@@ -178,7 +186,7 @@ def _analysis_failure(exc: Exception) -> AnalysisError:
             status_code=503,
             retryable=True,
         )
-    if "429" in message or "too many requests" in message:
+    if re.search(r"http\s+error\s+429\s*:\s*too many requests|too many requests", message):
         return AnalysisError(
             "source_rate_limited",
             "YouTube is rate-limiting requests from this server. Wait before retrying.",
@@ -199,7 +207,7 @@ def _analysis_failure(exc: Exception) -> AnalysisError:
             status_code=503,
             retryable=True,
         )
-    if "403" in message or "forbidden" in message or "po token" in message:
+    if re.search(r"http\s+error\s+403\s*:\s*forbidden", message) or "po token" in message:
         return AnalysisError(
             "youtube_request_blocked",
             "YouTube rejected this server's request. This may be caused by server network restrictions or a format-token requirement; it does not necessarily mean the video requires sign-in.",
@@ -274,12 +282,28 @@ def analyze_video(raw_url: str) -> dict:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
         failure = _analysis_failure(exc)
+        http_signatures = ",".join(
+            signature for event, signature in (
+                ("http_429_error_signature", "429"),
+                ("http_403_error_signature", "403"),
+            ) if is_youtube and event in diagnostics.events
+        ) if is_youtube else "none"
+        final_stage = next((
+            stage for label, stage in (
+                ("player_response_missing", "player_response"),
+                ("player_api_attempted", "player_api"),
+                ("webpage_request_attempted", "webpage"),
+                ("js_challenge_mentioned", "javascript_challenge"),
+            ) if label in diagnostics.events
+        ), "unknown") if is_youtube else "unknown"
         logger.warning(
-            "video analysis failed host=%s failure_code=%s exception_type=%s yt_dlp_events=%s",
+            "video analysis failed host=%s failure_code=%s exception_type=%s yt_dlp_stage=%s yt_dlp_http_error_signatures=%s yt_dlp_events=%s",
             urlparse(url).hostname,
             failure.code,
             type(exc).__name__,
-            ",".join(sorted(diagnostics.events)) if is_youtube else "",
+            final_stage,
+            http_signatures or "none",
+            ",".join(diagnostics.events) if is_youtube else "",
         )
         raise failure from exc
 

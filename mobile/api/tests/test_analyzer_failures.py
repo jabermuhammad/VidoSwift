@@ -93,9 +93,10 @@ class AnalysisFailureTests(unittest.TestCase):
             with self.assertRaises(AnalysisError) as raised:
                 analyze_video("https://youtube.com/watch?v=abc123")
         self.assertEqual(raised.exception.code, "source_rate_limited")
-        self.assertEqual(warning.call_args.args[1:], (
-            "youtube.com", "source_rate_limited", "RuntimeError", "",
+        self.assertEqual(warning.call_args.args[1:4], (
+            "youtube.com", "source_rate_limited", "RuntimeError",
         ))
+        self.assertEqual(warning.call_args.args[4:6], ("unknown", "none"))
         self.assertNotIn("abc123", str(warning.call_args))
 
     def test_ytdlp_diagnostic_collector_keeps_only_safe_event_labels(self):
@@ -104,8 +105,38 @@ class AnalysisFailureTests(unittest.TestCase):
         diagnostics = _YtDlpDiagnostics()
         diagnostics.debug("[debug] Downloading webpage https://youtube.com/watch?v=secret")
         diagnostics.warning("Sign in to confirm you're not a bot")
-        self.assertEqual(diagnostics.events, {"webpage_request", "bot_or_consent_check"})
+        self.assertEqual(diagnostics.events, ["webpage_request_attempted", "bot_verification_message"])
         self.assertNotIn("secret", repr(diagnostics.events))
+
+    def test_event_labels_do_not_turn_mentions_into_confirmed_causes(self):
+        from app.services.analyzer import _YtDlpDiagnostics
+
+        diagnostics = _YtDlpDiagnostics()
+        diagnostics.debug("The extractor supports PO Token providers and JavaScript runtimes.")
+        diagnostics.debug("403 and 429 are documented HTTP statuses; the player API may be requested.")
+
+        self.assertIn("po_token_mentioned", diagnostics.events)
+        self.assertIn("player_api_attempted", diagnostics.events)
+        self.assertNotIn("po_token_requirement_observed", diagnostics.events)
+        self.assertNotIn("http_403_error_signature", diagnostics.events)
+        self.assertNotIn("http_429_error_signature", diagnostics.events)
+        self.assertNotIn("js_runtime_unavailable", diagnostics.events)
+        failure = _analysis_failure(RuntimeError("Failed to extract any player response"))
+        self.assertEqual(failure.code, "youtube_player_response_missing")
+
+    def test_explicit_http_status_and_token_signals_are_distinguished(self):
+        from app.services.analyzer import _YtDlpDiagnostics
+
+        diagnostics = _YtDlpDiagnostics()
+        diagnostics.error("ERROR: HTTP Error 429: Too Many Requests")
+        diagnostics.error("WARNING: A PO Token is required for this client")
+
+        self.assertIn("http_429_error_signature", diagnostics.events)
+        self.assertIn("po_token_requirement_observed", diagnostics.events)
+        # Earlier diagnostic lines in a multi-request extraction aren't enough
+        # to claim that they caused a later generic player-response failure.
+        failure = _analysis_failure(RuntimeError("Failed to extract any player response"))
+        self.assertEqual(failure.code, "youtube_player_response_missing")
 
     def test_bot_consent_verification_and_unexpected_errors_are_safely_classified(self):
         self.assertEqual(
@@ -138,6 +169,18 @@ class AnalysisFailureTests(unittest.TestCase):
         }
         self.assertIn("GET", methods)
         self.assertIn("HEAD", methods)
+
+    def test_analyze_route_is_post_and_health_stays_ready(self):
+        analyze_methods = {
+            method
+            for route in main.app.routes
+            if getattr(route, "path", None) == "/v1/analyze"
+            for method in getattr(route, "methods", set())
+        }
+        self.assertEqual(analyze_methods, {"POST"})
+        health = main.health()
+        self.assertTrue(health["ok"])
+        self.assertEqual(health["status"], "ready")
 
     def test_download_handlers_accept_query_contract_without_external_requests(self):
         with TemporaryDirectory(dir=Path.cwd()) as root:
