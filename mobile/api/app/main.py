@@ -81,7 +81,9 @@ def health_head() -> Response:
     response_model=AnalyzeResponse,
     responses={
         422: {"model": ErrorResponse, "description": "Invalid URL, platform restriction, or unavailable formats."},
+        429: {"model": ErrorResponse, "description": "YouTube is rate-limiting analysis requests."},
         502: {"model": ErrorResponse, "description": "The platform did not return usable metadata."},
+        503: {"model": ErrorResponse, "description": "YouTube could not provide a player response or requires an unavailable verification step."},
         504: {"model": ErrorResponse, "description": "Analysis timed out and can be retried."},
     },
     tags=["analysis"],

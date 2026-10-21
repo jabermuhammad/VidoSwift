@@ -1,7 +1,11 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
-from app.services.analyzer import AnalysisError, _analysis_failure, analyze_video
+from app import main
+from app.schemas import AnalyzeRequest
+from app.services.analyzer import AnalysisError, _analysis_failure, analyze_video, youtube_extractor_args
 
 
 class AnalysisFailureTests(unittest.TestCase):
@@ -56,6 +60,13 @@ class AnalysisFailureTests(unittest.TestCase):
         failure = _analysis_failure(RuntimeError("PO Token required for this client"))
         self.assertEqual(failure.code, "po_token_required")
 
+    def test_current_yt_dlp_uses_library_default_clients_without_forced_embedded_request(self):
+        self.assertEqual(youtube_extractor_args("2026.10.10"), {"youtube": {"player_client": ["default"]}})
+        self.assertEqual(
+            youtube_extractor_args("2026.09.01"),
+            {"youtube": {"player_client": ["default", "-tv_downgraded"]}},
+        )
+
     @patch("app.services.analyzer.validate_public_video_url", return_value="https://www.youtube.com/watch?v=abc123")
     @patch("app.services.analyzer.YoutubeDL")
     def test_successful_analysis_uses_metadata_only(self, youtube_dl, _validate):
@@ -104,6 +115,42 @@ class AnalysisFailureTests(unittest.TestCase):
         unexpected = _analysis_failure(RuntimeError("unexpected parser failure"))
         self.assertEqual(unexpected.code, "analysis_failed")
         self.assertNotIn("parser failure", unexpected.message)
+
+    def test_analyze_route_returns_structured_retryable_upstream_error(self):
+        def fail(_url):
+            raise _analysis_failure(RuntimeError("Failed to extract any player response"))
+
+        with patch("app.main.analyze_video", side_effect=fail):
+            response = main.analyze(AnalyzeRequest(url="https://www.youtube.com/watch?v=abc123"))
+
+        self.assertEqual(response.status_code, 503)
+        body = response.body.decode("utf-8")
+        self.assertIn('"code":"youtube_player_response_missing"', body)
+        self.assertIn('"retryable":true', body)
+        self.assertNotIn("DownloadError", body)
+
+    def test_download_route_exposes_get_and_head_handlers(self):
+        methods = {
+            method
+            for route in main.app.routes
+            if getattr(route, "path", None) == "/v1/download"
+            for method in getattr(route, "methods", set())
+        }
+        self.assertIn("GET", methods)
+        self.assertIn("HEAD", methods)
+
+    def test_download_handlers_accept_query_contract_without_external_requests(self):
+        with TemporaryDirectory(dir=Path.cwd()) as root:
+            media = Path(root) / "sample.mp4"
+            media.write_bytes(b"test-media")
+            with patch("app.main.validate_public_video_url", side_effect=lambda url: url):
+                with patch("app.main.download_video", return_value=(media, Path(root), "video/mp4", "sample.mp4")):
+                    probe = main.download_probe(url="https://youtu.be/example", quality="720p")
+                    download = main.download(url="https://youtu.be/example", quality="720p")
+
+        self.assertEqual(probe.status_code, 204)
+        self.assertEqual(download.status_code, 200)
+        self.assertEqual(download.media_type, "video/mp4")
 
 
 if __name__ == "__main__":

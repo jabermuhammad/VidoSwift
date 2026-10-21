@@ -34,6 +34,11 @@ class _YtDlpDiagnostics:
         ("rate_limit", re.compile(r"429|too many requests", re.I)),
         ("forbidden", re.compile(r"403|forbidden", re.I)),
         ("player_response_missing", re.compile(r"failed to extract any player response", re.I)),
+        ("initial_response_missing", re.compile(r"unable to extract initial player response", re.I)),
+        ("player_version_missing", re.compile(r"unable to extract player version", re.I)),
+        ("player_response_json_invalid", re.compile(r"failed to parse json|jsondecodeerror", re.I)),
+        ("player_responses_invalid", re.compile(r"all player responses are invalid", re.I)),
+        ("player_response_status_error", re.compile(r"player response playability status: (?:error|unplayable|login_required)", re.I)),
         ("player_api_request", re.compile(r"player api", re.I)),
         ("webpage_request", re.compile(r"downloading webpage", re.I)),
         ("js_runtime", re.compile(r"javascript runtime|js challenge", re.I)),
@@ -86,11 +91,11 @@ def youtube_host(url: str) -> bool:
 
 
 def youtube_extractor_args(version: str = __version__) -> dict:
-    """Carry forward VidoSwift's tv_downgraded workaround and embed fallback."""
+    """Use yt-dlp's own default client set, without forcing extra client requests."""
     if _version_tuple(version) >= YOUTUBE_FIX_VERSION:
-        clients = ["default", "web_embedded"]
+        clients = ["default"]
     else:
-        clients = ["default", "-tv_downgraded", "web_embedded"]
+        clients = ["default", "-tv_downgraded"]
     return {"youtube": {"player_client": clients}}
 
 
