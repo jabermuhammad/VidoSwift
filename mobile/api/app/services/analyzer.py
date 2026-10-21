@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from collections.abc import Iterator
 from functools import lru_cache
 from urllib.parse import urlparse
@@ -182,6 +183,11 @@ def _exception_chain(exc: BaseException) -> Iterator[BaseException]:
             pending.append(exc_info[1])
 
 
+def _exception_chain_types(exc: BaseException) -> str:
+    """Return exception class names only; never log raw URLs or response text."""
+    return ">".join(type(item).__name__ for item in _exception_chain(exc))
+
+
 def _http_status_from_exception(exc: BaseException) -> int | None:
     """Return only a status carried by a structured response/HTTP exception."""
     for item in _exception_chain(exc):
@@ -308,6 +314,7 @@ def _analysis_failure(exc: Exception) -> AnalysisError:
 
 
 def analyze_video(raw_url: str) -> dict:
+    started_at = time.monotonic()
     url = validate_public_video_url(raw_url)
     is_youtube = youtube_host(url)
     options = {
@@ -344,14 +351,16 @@ def analyze_video(raw_url: str) -> dict:
         ) if is_youtube else ""
         final_stage = _failure_stage(exc, diagnostics.events) if is_youtube else "unknown"
         logger.warning(
-            "video analysis failed host=%s failure_code=%s exception_type=%s yt_dlp_stage_inferred=%s yt_dlp_http_status=%s yt_dlp_http_error_text_matches=%s yt_dlp_events=%s",
+            "video analysis failed host=%s failure_code=%s exception_type=%s yt_dlp_exception_chain=%s yt_dlp_stage_inferred=%s yt_dlp_http_status=%s yt_dlp_http_error_text_matches=%s yt_dlp_events=%s elapsed_ms=%d",
             urlparse(url).hostname,
             failure.code,
             type(exc).__name__,
+            _exception_chain_types(exc),
             final_stage,
             str(http_status) if http_status is not None else "unavailable",
             http_text_matches or "none",
             ",".join(diagnostics.events) if is_youtube else "",
+            round((time.monotonic() - started_at) * 1000),
         )
         raise failure from exc
 

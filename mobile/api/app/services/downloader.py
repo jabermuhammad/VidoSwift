@@ -37,20 +37,23 @@ class DownloadError(Exception):
         self.retryable = retryable
 
 
+def _quality_format_selector(quality: str, *, ffmpeg_available: bool) -> str:
+    """Select a format at or below the requested height, merging streams only with FFmpeg."""
+    if quality == "best":
+        return "bestvideo*+bestaudio/best" if ffmpeg_available else "best[ext=mp4]/best"
+
+    height = QUALITY_HEIGHTS[quality]
+    if ffmpeg_available:
+        # yt-dlp's documented split-stream selector, with a combined-format fallback.
+        return f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+    # Without FFmpeg, accept only a pre-merged audio+video format and never exceed the cap.
+    return f"best[height<={height}][ext=mp4]/best[height<={height}]"
+
+
 def download_video(raw_url: str, quality: str) -> tuple[Path, Path, str, str]:
     url = validate_public_video_url(raw_url)
     ffmpeg_available = shutil.which("ffmpeg") is not None
-    if not ffmpeg_available:
-        if quality == "best":
-            selector = "best[ext=mp4][vcodec!=none][acodec!=none]/best[vcodec!=none][acodec!=none]"
-        else:
-            height = QUALITY_HEIGHTS[quality]
-            selector = f"best[height<={height}][ext=mp4][vcodec!=none][acodec!=none]/best[height<={height}][vcodec!=none][acodec!=none]"
-    elif quality == "best":
-        selector = "best[ext=mp4]/best"
-    else:
-        height = QUALITY_HEIGHTS[quality]
-        selector = f"best[height<={height}][ext=mp4]/best[height<={height}]/best[ext=mp4]/best"
+    selector = _quality_format_selector(quality, ffmpeg_available=ffmpeg_available)
 
     if not DOWNLOAD_SEMAPHORE.acquire(blocking=False):
         raise DownloadError("download_busy", "A download is already running. Wait briefly and retry.", status_code=429, retryable=True)
@@ -111,7 +114,22 @@ def download_video(raw_url: str, quality: str) -> tuple[Path, Path, str, str]:
             raise DownloadError("source_rate_limited", "The video platform is rate-limiting downloads. Wait and retry.", status_code=429, retryable=True) from exc
         if "ffmpeg" in message:
             raise DownloadError("ffmpeg_required", "This quality requires FFmpeg, which is not installed on the API server.", status_code=503) from exc
+        if "requested format is not available" in message:
+            label = "Best available" if quality == "best" else f"{QUALITY_HEIGHTS[quality]}p or lower"
+            raise DownloadError(
+                "quality_unavailable",
+                f"No downloadable audio/video format is available at {label}. Re-analyze and choose another listed quality, or try Best available. Separate video and audio streams can only be merged when FFmpeg is installed.",
+                status_code=422,
+            ) from exc
         if any(marker in message for marker in ("sign in", "login_required", "not a bot", "confirm you're not", "confirm you’re not")):
+            is_bot_check = "not a bot" in message or "confirm you're not" in message or "confirm you’re not" in message
+            if is_bot_check:
+                raise DownloadError(
+                    "youtube_bot_verification",
+                    "YouTube asked this server to complete a bot check. This may affect public videos; the API cannot complete that check automatically. Try again later.",
+                    status_code=503,
+                    retryable=True,
+                ) from exc
             raise DownloadError("authentication_required", "The platform requires a signed-in session or restricts server downloads.", status_code=422) from exc
         raise DownloadError("download_failed", "The source rejected the download or the selected format is unavailable.", status_code=422, retryable=True) from exc
     finally:

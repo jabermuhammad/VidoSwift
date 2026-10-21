@@ -111,8 +111,28 @@ class AnalysisFailureTests(unittest.TestCase):
         self.assertEqual(warning.call_args.args[1:4], (
             "youtube.com", "source_rate_limited", "DownloadError",
         ))
-        self.assertEqual(warning.call_args.args[4:7], ("player_response", "429", "none"))
+        self.assertEqual(warning.call_args.args[4:8], ("DownloadError>ExtractorError>HTTPError", "player_response", "429", "none"))
         self.assertNotIn("abc123", str(warning.call_args))
+
+    def test_player_response_failure_logs_exception_types_and_duration_without_raw_details(self):
+        fake_ydl = MagicMock()
+        fake_ydl.__enter__.return_value = fake_ydl
+        fake_ydl.extract_info.side_effect = YtDlpDownloadError(
+            "Failed to extract any player response for https://youtube.com/watch?v=private-id"
+        )
+        with patch("app.services.analyzer.validate_public_video_url", return_value="https://youtube.com/watch?v=private-id"), \
+             patch("app.services.analyzer.YoutubeDL", return_value=fake_ydl), \
+             patch("app.services.analyzer.logger.warning") as warning:
+            with self.assertRaises(AnalysisError):
+                analyze_video("https://youtube.com/watch?v=private-id")
+
+        fields = warning.call_args.args[0]
+        values = warning.call_args.args[1:]
+        self.assertIn("yt_dlp_exception_chain=%s", fields)
+        self.assertIn("elapsed_ms=%d", fields)
+        self.assertEqual(values[3], "DownloadError")
+        self.assertGreaterEqual(values[-1], 0)
+        self.assertNotIn("private-id", repr(warning.call_args))
 
     def test_ytdlp_diagnostic_collector_keeps_only_safe_event_labels(self):
         from app.services.analyzer import _YtDlpDiagnostics
@@ -193,6 +213,24 @@ class AnalysisFailureTests(unittest.TestCase):
         self.assertIn('"code":"youtube_player_response_missing"', body)
         self.assertIn('"retryable":true', body)
         self.assertNotIn("DownloadError", body)
+
+    def test_analyze_route_preserves_successful_metadata_response(self):
+        payload = {
+            "ok": True,
+            "video": {
+                "id": "abc123", "title": "Public video", "thumbnail": "", "duration": 60,
+                "duration_text": "01:00", "extractor": "Youtube", "uploader": "Channel",
+                "view_count": 10,
+                "formats": [{"format_id": "18", "ext": "mp4", "height": 360,
+                             "resolution": "360p", "note": "", "filesize": 1000,
+                             "has_video": True, "has_audio": True}],
+                "heights": [360], "estimated_size": 1000, "estimated_size_text": "1000.0 B",
+            },
+        }
+        with patch("app.main.analyze_video", return_value=payload):
+            response = main.analyze(AnalyzeRequest(url="https://www.youtube.com/watch?v=abc123"))
+
+        self.assertEqual(response, payload)
 
     def test_download_route_exposes_get_and_head_handlers(self):
         methods = {
